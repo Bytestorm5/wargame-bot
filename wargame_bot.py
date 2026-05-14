@@ -718,6 +718,17 @@ async def background_loop():
         log.exception("Background tick failed")
 
 
+async def _get_channel(channel_id: int) -> Optional[discord.abc.Messageable]:
+    """Return the channel object, trying cache first then API fetch."""
+    ch = bot.get_channel(channel_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.warning("Could not resolve channel %s: %s", channel_id, e)
+    return ch  # type: ignore[return-value]
+
+
 async def _process_tick():
     now_real = _utcnow()
 
@@ -734,16 +745,19 @@ async def _process_tick():
             continue
         world_target = _ensure_aware(r["world_target"])
         if clock.world_now() >= world_target:
-            channel = bot.get_channel(r["channel_id"])
+            channel = await _get_channel(r["channel_id"])
             if channel is not None:
                 try:
                     await channel.send(
                         f"⏰ <@{r['user_id']}> reminder for "
                         f"**{format_world(world_target)}** (in-world): {r['message']}"
                     )
+                    # Only delete after a confirmed send.
+                    await store.delete_reminder(r["_id"])
                 except discord.HTTPException as e:
-                    log.warning("Failed to send reminder: %s", e)
-            await store.delete_reminder(r["_id"])
+                    log.warning("Failed to send reminder %s: %s", r["_id"], e)
+            else:
+                log.warning("Reminder %s: channel %s not found, will retry next tick.", r["_id"], r["channel_id"])
 
     # --- Tickers: real-time only; world clock state only affects displayed text. ---
     async for t in store.tickers.find({}):
@@ -755,14 +769,16 @@ async def _process_tick():
         next_fire = _ensure_aware(t["next_fire"])
         if now_real < next_fire:
             continue
-        channel = bot.get_channel(t["channel_id"])
+        channel = await _get_channel(t["channel_id"])
         if channel is not None:
             suffix = " (paused)" if clock.paused else ""
             try:
                 await channel.send(f"🕰️ **{format_world(clock.world_now())}**{suffix}")
             except discord.HTTPException as e:
-                log.warning("Failed to send ticker: %s", e)
-        # Skip missed slots so we don't spam catch-up posts.
+                log.warning("Failed to send ticker for guild %s: %s", gid, e)
+        else:
+            log.warning("Ticker for guild %s: channel %s not found, skipping fire.", gid, t["channel_id"])
+        # Advance next_fire regardless — avoid hammering a bad channel every 10s.
         interval = t["real_interval_seconds"]
         while next_fire <= now_real:
             next_fire += timedelta(seconds=interval)
