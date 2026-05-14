@@ -1,0 +1,9 @@
+services:
+  bot:
+    image: ghcr.io/bytestorm5/wargame-bot:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: .env
+    mem_limit: 256m
+    read_only: true
+    tmpfs:
+      - /tmp
